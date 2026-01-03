@@ -1,0 +1,14 @@
+[project]
+name = "book_extractor"
+version = "0.1.0"
+description = "English Grammar in Use extraction app"
+requires-python = ">=3.10"
+
+dependencies = [
+  "pymupdf>=1.23.0",
+  "pillow>=10.0.0",
+  "pytesseract>=0.3.10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
