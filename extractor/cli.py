@@ -12,6 +12,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ocr", type=str, default="true", help="Enable OCR true/false")
     parser.add_argument("--units", nargs=2, type=int, metavar=("START", "END"), default=[1, 145])
     parser.add_argument("--debug", type=str, default="true", help="Enable debug overlays true/false")
+    parser.add_argument("--strict-units", type=str, default="false", help="Fail on missing units true/false")
+    parser.add_argument("--extract-keys", type=str, default="true", help="Extract answer keys true/false")
     return parser
 
 
@@ -30,6 +32,8 @@ def main() -> int:
         unit_start=args.units[0],
         unit_end=args.units[1],
         debug_enabled=str_to_bool(args.debug),
+        strict_units=str_to_bool(args.strict_units),
+        extract_keys=str_to_bool(args.extract_keys),
     )
     run_extraction(config)
     return 0
