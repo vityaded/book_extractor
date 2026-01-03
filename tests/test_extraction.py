@@ -26,6 +26,8 @@ def test_detect_units_1_3():
         unit_start=1,
         unit_end=3,
         debug_enabled=False,
+        strict_units=False,
+        extract_keys=True,
     )
     from extractor.pdf_utils import PdfDocument
 
@@ -39,6 +41,31 @@ def test_detect_units_1_3():
 
 
 @pytest.mark.skipif(not PDF_PATH.exists(), reason="PDF not available")
+def test_detect_units_smoke_units_1_2(tmp_path):
+    config = ExtractionConfig(
+        pdf_path=PDF_PATH,
+        out_dir=tmp_path,
+        dpi=72,
+        ocr_enabled=False,
+        unit_start=1,
+        unit_end=2,
+        debug_enabled=True,
+        strict_units=False,
+        extract_keys=True,
+    )
+    from extractor.pdf_utils import PdfDocument
+
+    doc = PdfDocument(config.pdf_path)
+    try:
+        units = detect_units(doc, config.unit_start, config.unit_end, config)
+    finally:
+        doc.close()
+    assert units
+    if len(units) < 2:
+        assert (tmp_path / "debug" / "unit002_missing.json").exists()
+
+
+@pytest.mark.skipif(not PDF_PATH.exists(), reason="PDF not available")
 def test_rule_and_exercise_sections_unit1(tmp_path):
     config = ExtractionConfig(
         pdf_path=PDF_PATH,
@@ -48,6 +75,8 @@ def test_rule_and_exercise_sections_unit1(tmp_path):
         unit_start=1,
         unit_end=1,
         debug_enabled=True,
+        strict_units=False,
+        extract_keys=True,
     )
     run_extraction(config)
     rules = (tmp_path / "rules.json").read_text()
@@ -71,6 +100,8 @@ def test_answer_key_contains_unit1():
             unit_start=1,
             unit_end=1,
             debug_enabled=False,
+            strict_units=False,
+            extract_keys=True,
         )
         keys = extract_answer_keys(doc, pages, config)
     finally:
@@ -88,6 +119,8 @@ def test_golden_units_1_2(tmp_path):
         unit_start=1,
         unit_end=2,
         debug_enabled=True,
+        strict_units=False,
+        extract_keys=True,
     )
     run_extraction(config)
     validate_schema_files(tmp_path)

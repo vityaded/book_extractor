@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import Iterable
 import fitz
 from PIL import Image
 
+from extractor.bbox_utils import safe_crop
 from extractor.debug_utils import draw_overlays, save_layout_json
 from extractor.layout import Section, build_sections, union_bbox
 from extractor.ocr_utils import ocr_text
@@ -17,6 +19,9 @@ from extractor.pdf_utils import PdfDocument, extract_text_blocks, extract_text_l
 UNIT_RE = re.compile(r"\bUnit\s+(\d{1,3})\b", re.IGNORECASE)
 EXERCISES_RE = re.compile(r"\bExercises\b", re.IGNORECASE)
 LABEL_RE = re.compile(r"^(\d+\.\d+|\d+)\b")
+UNIT_RE_NORM = re.compile(r"\bunit\s+(\d{1,3})\b")
+EXERCISES_LABEL_RE = re.compile(r"\b(?:n\.\d+|\d+\.\d+)\b")
+UNDERSCORE_RE = re.compile(r"_{3,}")
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,8 @@ class ExtractionConfig:
     unit_start: int
     unit_end: int
     debug_enabled: bool
+    strict_units: bool = False
+    extract_keys: bool = True
 
 
 def run_extraction(config: ExtractionConfig) -> None:
@@ -39,11 +46,14 @@ def run_extraction(config: ExtractionConfig) -> None:
 
     doc = PdfDocument(config.pdf_path)
     try:
-        units = detect_units(doc, config.unit_start, config.unit_end)
+        units = detect_units(doc, config.unit_start, config.unit_end, config)
         answer_key_pages = detect_answer_key_pages(doc)
         rules_payload = []
         exercises_payload = []
-        answer_key_payload = extract_answer_keys(doc, answer_key_pages, config)
+        if config.extract_keys:
+            answer_key_payload = extract_answer_keys(doc, answer_key_pages, config)
+        else:
+            answer_key_payload = []
         answer_key_lookup = {(item["unit_id"], item["label"]): item for item in answer_key_payload}
 
         for unit in units:
@@ -124,18 +134,42 @@ def run_extraction(config: ExtractionConfig) -> None:
         doc.close()
 
 
-def detect_units(doc: PdfDocument, start: int, end: int) -> list[dict]:
+def detect_units(doc: PdfDocument, start: int, end: int, config: ExtractionConfig) -> list[dict]:
     units: dict[int, dict] = {}
+    page_cache: dict[int, dict] = {}
+    page_count = len(doc)
+    min_chars = 40
+
+    def normalized_page_text(page: fitz.Page) -> dict:
+        if page.number in page_cache:
+            return page_cache[page.number]
+        text_pdf = page.get_text("text") or ""
+        text_source = text_pdf
+        used_ocr = False
+        if len(text_pdf.strip()) < min_chars and config.ocr_enabled:
+            rendered = render_page(page, config.dpi)
+            text_ocr = ocr_text(rendered.image)
+            if text_ocr.strip():
+                text_source = text_ocr
+                used_ocr = True
+        normalized = normalize_text(text_source)
+        data = {
+            "normalized": normalized,
+            "used_ocr": used_ocr,
+            "source_text": text_source,
+        }
+        page_cache[page.number] = data
+        return data
+
     for page in doc.iter_pages():
-        text = page.get_text("text")
-        match = UNIT_RE.search(text)
+        page_text = normalized_page_text(page)
+        match = UNIT_RE_NORM.search(page_text["normalized"])
         if not match:
             continue
         unit_num = int(match.group(1))
         if unit_num < start or unit_num > end:
             continue
-        title = extract_unit_title(text, unit_num)
-        is_exercise = bool(EXERCISES_RE.search(text))
+        title = extract_unit_title(page_text["source_text"], unit_num)
         entry = units.setdefault(
             unit_num,
             {
@@ -145,25 +179,98 @@ def detect_units(doc: PdfDocument, start: int, end: int) -> list[dict]:
                 "exercise_page_index": None,
             },
         )
+        if entry["rule_page_index"] is None:
+            entry["rule_page_index"] = page.number
         if entry["title"].startswith("Unit") and title:
             entry["title"] = title
-        if is_exercise:
-            if entry["exercise_page_index"] is None:
-                entry["exercise_page_index"] = page.number
-        else:
-            if entry["rule_page_index"] is None:
-                entry["rule_page_index"] = page.number
 
-    missing = [num for num in range(start, end + 1) if num not in units]
-    if missing:
-        raise ValueError(f"Missing units in PDF: {missing}")
     results = []
     for unit_num in range(start, end + 1):
-        entry = units[unit_num]
-        if entry["rule_page_index"] is None or entry["exercise_page_index"] is None:
-            raise ValueError(f"Unit {unit_num} missing rule or exercise page.")
+        entry = units.setdefault(
+            unit_num,
+            {
+                "unit_id": f"{unit_num:03d}",
+                "title": f"Unit {unit_num}",
+                "rule_page_index": None,
+                "exercise_page_index": None,
+            },
+        )
+        rule_idx = entry["rule_page_index"]
+        exercise_idx = None
+        if rule_idx is not None:
+            candidate_indices = [
+                idx
+                for idx in range(rule_idx + 1, min(rule_idx + 4, page_count))
+            ]
+            for idx in candidate_indices:
+                page_text = normalized_page_text(doc.page(idx))
+                if EXERCISES_RE.search(page_text["normalized"]):
+                    exercise_idx = idx
+                    break
+            if exercise_idx is None:
+                for idx in candidate_indices:
+                    page_text = normalized_page_text(doc.page(idx))
+                    if EXERCISES_LABEL_RE.search(page_text["normalized"]) or UNDERSCORE_RE.search(
+                        page_text["normalized"]
+                    ):
+                        exercise_idx = idx
+                        break
+        entry["exercise_page_index"] = exercise_idx
+        if rule_idx is None or exercise_idx is None:
+            log_missing_unit(unit_num, rule_idx, config, doc, normalized_page_text)
+            if config.strict_units:
+                raise ValueError(f"Unit {unit_num} missing rule or exercise page.")
+            logging.warning(
+                "Unit %s missing rule or exercise page (rule=%s, ex=%s)",
+                unit_num,
+                rule_idx,
+                exercise_idx,
+            )
+            continue
         results.append(entry)
+
     return results
+
+
+def normalize_text(text: str) -> str:
+    normalized = text.lower()
+    normalized = normalized.replace("unlt", "unit")
+    normalized = normalized.replace("exerclses", "exercises")
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip()
+
+
+def log_missing_unit(
+    unit_num: int,
+    rule_idx: int | None,
+    config: ExtractionConfig,
+    doc: PdfDocument,
+    page_text_fn,
+) -> None:
+    debug_dir = config.out_dir / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    candidates = []
+    if rule_idx is not None:
+        unit_re = re.compile(rf"\\bunit\\s+{unit_num}\\b")
+        for idx in range(rule_idx, min(rule_idx + 4, len(doc))):
+            page_text = page_text_fn(doc.page(idx))
+            normalized = page_text["normalized"]
+            candidates.append(
+                {
+                    "page_index": idx,
+                    "unit_match": bool(unit_re.search(normalized)),
+                    "exercise_match": bool(EXERCISES_RE.search(normalized)),
+                    "text_source": "ocr" if page_text["used_ocr"] else "pdf",
+                    "text_preview": normalized[:300],
+                }
+            )
+    payload = {
+        "unit": unit_num,
+        "rule_page_index": rule_idx,
+        "candidates": candidates,
+    }
+    out_path = debug_dir / f"unit{unit_num:03d}_missing.json"
+    out_path.write_text(json.dumps(payload, indent=2))
 
 
 def extract_unit_title(text: str, unit_num: int) -> str:
@@ -192,11 +299,6 @@ def scale_bbox(bbox: tuple[float, float, float, float], scale: float) -> list[in
     return [int(x0 * scale), int(y0 * scale), int((x1 - x0) * scale), int((y1 - y0) * scale)]
 
 
-def crop_image(image: Image.Image, bbox_px: list[int]) -> Image.Image:
-    x, y, w, h = bbox_px
-    return image.crop((x, y, x + w, y + h))
-
-
 def extract_rule_sections(
     page: fitz.Page, image: Image.Image, config: ExtractionConfig, unit_id: str
 ) -> list[dict]:
@@ -205,12 +307,20 @@ def extract_rule_sections(
     if not sections:
         raise ValueError(f"No rule sections detected for unit {unit_id}")
     scale = config.dpi / 72.0
+    debug_log = config.out_dir / "debug" / "bbox_warnings.log"
     output_sections: list[dict] = []
     for idx, section in enumerate(sections):
         label = chr(ord("A") + idx)
         bbox_px = scale_bbox(section.bbox, scale)
         crop_path = config.out_dir / "assets" / "rules" / f"unit{unit_id}_{label}.png"
-        crop = crop_image(image, bbox_px)
+        crop = safe_crop(
+            image,
+            bbox_px,
+            context=f"rules/unit{unit_id}/{label}",
+            log_path=debug_log,
+        )
+        if crop is None:
+            continue
         crop.save(crop_path)
         text_pdf = section.text.strip()
         text_ocr = ocr_text(crop) if config.ocr_enabled else ""
@@ -253,6 +363,7 @@ def extract_exercise_sections(
     content_blocks = [block for block in extract_text_blocks(page) if block.text.strip()]
     content_bbox = union_bbox(content_blocks)
     scale = config.dpi / 72.0
+    debug_log = config.out_dir / "debug" / "bbox_warnings.log"
     sections: list[dict] = []
     for idx, label_info in enumerate(labels):
         start_y = label_info["bbox"][1]
@@ -267,7 +378,14 @@ def extract_exercise_sections(
         label = label_info["label"]
         label_id = label.replace(".", "_")
         crop_path = config.out_dir / "assets" / "exercises" / f"unit{unit_id}_{label_id}.png"
-        crop = crop_image(image, bbox_px)
+        crop = safe_crop(
+            image,
+            bbox_px,
+            context=f"exercises/unit{unit_id}/{label_id}",
+            log_path=debug_log,
+        )
+        if crop is None:
+            continue
         crop.save(crop_path)
         text_pdf = "\n".join(block.text.strip() for block in section_blocks if block.text.strip())
         text_ocr = ocr_text(crop) if config.ocr_enabled else ""
@@ -315,6 +433,7 @@ def detect_boxed_regions(
     section_height = sy1 - sy0
     regions: list[dict] = []
     index = 1
+    debug_log = config.out_dir / "debug" / "bbox_warnings.log"
 
     drawings = page.get_drawings()
     for drawing in drawings:
@@ -340,7 +459,14 @@ def detect_boxed_regions(
             / "exercises"
             / f"{section_label}_box{index:02d}.png"
         )
-        crop = crop_image(image, bbox_px)
+        crop = safe_crop(
+            image,
+            bbox_px,
+            context=f"{section_label}/box{index:02d}",
+            log_path=debug_log,
+        )
+        if crop is None:
+            continue
         crop.save(crop_path)
         regions.append(
             {
@@ -371,7 +497,14 @@ def detect_boxed_regions(
             / "exercises"
             / f"{section_label}_box{index:02d}.png"
         )
-        crop = crop_image(image, bbox_px)
+        crop = safe_crop(
+            image,
+            bbox_px,
+            context=f"{section_label}/box{index:02d}",
+            log_path=debug_log,
+        )
+        if crop is None:
+            continue
         crop.save(crop_path)
         regions.append(
             {
@@ -419,6 +552,8 @@ def extract_answer_keys(
             continue
         blocks = extract_text_blocks(page)
         content_bbox = union_bbox(blocks)
+        debug_log = config.out_dir / "debug" / "bbox_warnings.log"
+        rendered_page = render_page(page, config.dpi)
         for idx, label_info in enumerate(labels):
             start_y = label_info["bbox"][1]
             end_y = labels[idx + 1]["bbox"][1] if idx + 1 < len(labels) else content_bbox[3]
@@ -433,7 +568,14 @@ def extract_answer_keys(
             scale = config.dpi / 72.0
             bbox_px = scale_bbox(bbox, scale)
             text_pdf = "\n".join(block.text.strip() for block in section_blocks if block.text.strip())
-            crop = crop_image(render_page(page, config.dpi).image, bbox_px)
+            crop = safe_crop(
+                rendered_page.image,
+                bbox_px,
+                context=f"answer_keys/page{page_index}/{label}",
+                log_path=debug_log,
+            )
+            if crop is None:
+                continue
             text_ocr = ocr_text(crop) if config.ocr_enabled else ""
             text_best = text_pdf or text_ocr
             results.append(
