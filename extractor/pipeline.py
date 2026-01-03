@@ -18,7 +18,8 @@ from extractor.pdf_utils import PdfDocument, extract_text_blocks, extract_text_l
 
 UNIT_RE = re.compile(r"\bUnit\s+(\d{1,3})\b", re.IGNORECASE)
 EXERCISES_RE = re.compile(r"\bExercises\b", re.IGNORECASE)
-LABEL_RE = re.compile(r"^(\d+\.\d+|\d+)\b")
+PRIMARY_LABEL_RE = re.compile(r"(?<!\d)\b(\d+\.\d+)\b(?!\d)")
+STANDALONE_LABEL_RE = re.compile(r"(?<![\d\.])\b(\d{1,2})\b(?!\.)")
 UNIT_RE_NORM = re.compile(r"\bunit\s+(\d{1,3})\b")
 EXERCISES_LABEL_RE = re.compile(r"\b(?:n\.\d+|\d+\.\d+)\b")
 UNDERSCORE_RE = re.compile(r"_{3,}")
@@ -34,6 +35,7 @@ class ExtractionConfig:
     unit_end: int
     debug_enabled: bool
     strict_units: bool = False
+    strict_text: bool = False
     extract_keys: bool = True
 
 
@@ -240,6 +242,42 @@ def normalize_text(text: str) -> str:
     return normalized.strip()
 
 
+def bbox_overlaps(a: list[float] | tuple[float, ...], b: list[float] | tuple[float, ...]) -> bool:
+    ax0, ay0, ax1, ay1 = a
+    bx0, by0, bx1, by1 = b
+    return not (ax1 < bx0 or ax0 > bx1 or ay1 < by0 or ay0 > by1)
+
+
+def detect_exercise_labels(
+    lines: list[dict],
+    page_width: float,
+    *,
+    left_margin_ratio: float = 0.2,
+) -> list[dict]:
+    primary_labels: list[dict] = []
+    standalone_labels: list[dict] = []
+    left_margin = page_width * left_margin_ratio
+
+    for line in lines:
+        text = line["text"]
+        bbox = line["bbox"]
+        for match in PRIMARY_LABEL_RE.finditer(text):
+            primary_labels.append({"label": match.group(1), "bbox": bbox})
+        if bbox[0] <= left_margin:
+            for match in STANDALONE_LABEL_RE.finditer(text):
+                standalone_labels.append({"label": match.group(1), "bbox": bbox})
+
+    filtered_standalone = []
+    for item in standalone_labels:
+        if any(bbox_overlaps(item["bbox"], primary["bbox"]) for primary in primary_labels):
+            continue
+        filtered_standalone.append(item)
+
+    labels = primary_labels + filtered_standalone
+    labels = sorted(labels, key=lambda item: item["bbox"][1])
+    return labels
+
+
 def log_missing_unit(
     unit_num: int,
     rule_idx: int | None,
@@ -352,11 +390,7 @@ def extract_exercise_sections(
     unit_title: str,
 ) -> list[dict]:
     lines = extract_text_lines(page)
-    labels = []
-    for line in lines:
-        match = LABEL_RE.match(line["text"])
-        if match:
-            labels.append({"label": match.group(1), "bbox": line["bbox"]})
+    labels = detect_exercise_labels(lines, page.rect.width)
     if not labels:
         raise ValueError(f"No exercise sections detected for unit {unit_id}")
     labels = sorted(labels, key=lambda item: item["bbox"][1])
@@ -388,10 +422,24 @@ def extract_exercise_sections(
             continue
         crop.save(crop_path)
         text_pdf = "\n".join(block.text.strip() for block in section_blocks if block.text.strip())
-        text_ocr = ocr_text(crop) if config.ocr_enabled else ""
-        text_best = text_pdf or text_ocr
-        if not text_best:
-            raise ValueError(f"Empty text for exercise section unit {unit_id} {label}")
+        padded_bbox_px = pad_bbox_px(bbox_px, pad_left=10, pad_right=10, pad_top=20, pad_bottom=10)
+        padded_crop = safe_crop(
+            image,
+            padded_bbox_px,
+            context=f"exercises/unit{unit_id}/{label_id}/padded",
+            log_path=debug_log,
+        )
+        text_ocr = ocr_text(padded_crop) if config.ocr_enabled else ""
+        text_best = select_exercise_text(
+            text_pdf=text_pdf,
+            text_ocr=text_ocr,
+            config=config,
+            unit_id=unit_id,
+            label=label,
+            exercise_section_id=f"unit{unit_id}_{label_id}",
+            bbox_px=bbox_px,
+            crop_path=crop_path,
+        )
         boxed_regions = detect_boxed_regions(
             page=page,
             section_bbox=bbox,
@@ -416,6 +464,82 @@ def extract_exercise_sections(
             }
         )
     return sections
+
+
+def pad_bbox_px(
+    bbox_px: tuple[float, float, float, float],
+    *,
+    pad_left: float,
+    pad_right: float,
+    pad_top: float,
+    pad_bottom: float,
+) -> tuple[float, float, float, float]:
+    x0, y0, width, height = bbox_px
+    return (
+        x0 - pad_left,
+        y0 - pad_top,
+        width + pad_left + pad_right,
+        height + pad_top + pad_bottom,
+    )
+
+
+def select_exercise_text(
+    *,
+    text_pdf: str,
+    text_ocr: str,
+    config: ExtractionConfig,
+    unit_id: str,
+    label: str,
+    exercise_section_id: str,
+    bbox_px: tuple[float, float, float, float],
+    crop_path: Path,
+) -> str:
+    text_pdf_clean = text_pdf.strip()
+    text_ocr_clean = text_ocr.strip()
+    if len(text_pdf_clean) >= 15:
+        return text_pdf
+    if len(text_ocr_clean) >= 5:
+        return text_ocr
+    if config.strict_text:
+        raise ValueError(f"Empty text for exercise section unit {unit_id} {label}")
+    logging.warning("Empty text for exercise section unit %s %s", unit_id, label)
+    record_empty_text_section(
+        config=config,
+        unit_id=unit_id,
+        label=label,
+        exercise_section_id=exercise_section_id,
+        bbox_px=bbox_px,
+        text_pdf_empty=not text_pdf_clean,
+        text_ocr_empty=not text_ocr_clean,
+        crop_path=crop_path,
+    )
+    return ""
+
+
+def record_empty_text_section(
+    *,
+    config: ExtractionConfig,
+    unit_id: str,
+    label: str,
+    exercise_section_id: str,
+    bbox_px: tuple[float, float, float, float],
+    text_pdf_empty: bool,
+    text_ocr_empty: bool,
+    crop_path: Path,
+) -> None:
+    record = {
+        "unit_id": unit_id,
+        "label": label,
+        "exercise_section_id": exercise_section_id,
+        "bbox_px": bbox_px,
+        "text_pdf_empty": text_pdf_empty,
+        "text_ocr_empty": text_ocr_empty,
+        "crop_image": str(crop_path.relative_to(config.out_dir)),
+    }
+    debug_path = config.out_dir / "debug" / "empty_text_sections.jsonl"
+    debug_path.parent.mkdir(parents=True, exist_ok=True)
+    with debug_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
 
 
 def detect_boxed_regions(
@@ -542,11 +666,7 @@ def extract_answer_keys(
     for page_index in answer_key_pages:
         page = doc.page(page_index)
         lines = extract_text_lines(page)
-        labels = []
-        for line in lines:
-            match = LABEL_RE.match(line["text"])
-            if match:
-                labels.append({"label": match.group(1), "bbox": line["bbox"]})
+        labels = detect_exercise_labels(lines, page.rect.width)
         labels = sorted(labels, key=lambda item: item["bbox"][1])
         if not labels:
             continue
